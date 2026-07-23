@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local Codex state
+.agents/
+.codex/
+
+# Unrelated nested checkout
+mace-scf/
+
+# Local models and generated simulation output
+*.model
+*.msgpack
+*.extxyz
