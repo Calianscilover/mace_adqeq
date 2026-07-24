@@ -19,9 +19,7 @@ from dmff.utils import pair_buffer_scales, regularize_pairs
 from jax.scipy.special import erfc
 
 
-def build_acsf_descriptor(
-    atoms, species, r_cut, g2_params, g4_params, n_jobs
-) -> np.ndarray:
+def build_acsf_descriptor(atoms, species, r_cut, g2_params, g4_params, n_jobs) -> np.ndarray:
     acsf = ACSF(
         species=list(species),
         r_cut=r_cut,
@@ -33,9 +31,7 @@ def build_acsf_descriptor(
     )
     acsf_str = acsf.create(atoms)
     # print(acsf_str.shape)
-    return np.asarray(
-        acsf.create(atoms, centers=None, n_jobs=n_jobs), dtype=np.float32
-    )
+    return np.asarray(acsf.create(atoms, centers=None, n_jobs=n_jobs), dtype=np.float32)
 
 
 def one_hot_encode(
@@ -43,9 +39,7 @@ def one_hot_encode(
     symbols: Sequence[str],
     element_map: Mapping[str, int],
 ) -> np.ndarray:
-    one_hot = np.zeros(
-        (descriptor.shape[0], len(element_map)), dtype=np.float32
-    )
+    one_hot = np.zeros((descriptor.shape[0], len(element_map)), dtype=np.float32)
     for atom_index, symbol in enumerate(symbols):
         one_hot[atom_index, element_map[symbol]] = 1.0
     return np.concatenate((descriptor.astype(np.float32), one_hot), axis=1)
@@ -62,23 +56,18 @@ class NeighborListFreud:
 
     def _do_cov_map(self, pairs):
         nbond = self.cov_map[pairs[:, 0], pairs[:, 1]]
-        return jnp.concatenate((pairs, nbond[:, None]), axis=1)
+        pairs = jnp.concatenate([pairs, nbond[:, None]], axis=1)
+        return pairs
 
     def allocate(self, coords, box=None):
         self._positions = coords
         fbox = freud.box.Box.from_matrix(box) if box is not None else self.fbox
         query = freud.locality.AABBQuery(fbox, coords)
-        result = query.query(
-            coords, {"r_max": self.rcut, "exclude_ii": True}
-        )
+        result = query.query(coords, {"r_max": self.rcut, "exclude_ii": True})
         neighbor_list = result.toNeighborList()
-        neighbor_list = np.vstack(
-            (neighbor_list[:, 0], neighbor_list[:, 1])
-        ).T
+        neighbor_list = np.vstack((neighbor_list[:, 0], neighbor_list[:, 1])).T
         neighbor_list = neighbor_list.astype(np.int32)
-        neighbor_list = neighbor_list[
-            neighbor_list[:, 0] < neighbor_list[:, 1]
-        ]
+        neighbor_list = neighbor_list[neighbor_list[:, 0] < neighbor_list[:, 1]]
 
         if self.capacity_multiplier is None:
             if self.max_shape == 0:
@@ -101,9 +90,7 @@ class NeighborListFreud:
         if padding_width == 0:
             self._pairs = self._do_cov_map(neighbor_list)
         elif padding_width > 0:
-            padding = np.full(
-                (padding_width, 2), coords.shape[0], dtype=np.int32
-            )
+            padding = np.full((padding_width, 2), coords.shape[0], dtype=np.int32)
             neighbor_list = np.vstack((neighbor_list, padding))
             self._pairs = self._do_cov_map(neighbor_list)
         else:
@@ -132,19 +119,13 @@ class NeighborListFreud:
 def get_neighbor_list(
     box, rc, positions, natoms, padding=True, max_shape=0
 ):
-    neighbor_list = NeighborListFreud(
-        box,
-        rc,
-        jnp.zeros((natoms, natoms), dtype=jnp.int32),
-        padding=padding,
-        max_shape=max_shape,
-    )
+    neighbor_list = NeighborListFreud(box,rc,jnp.zeros((natoms, natoms), dtype=jnp.int32),padding=padding,max_shape=max_shape)
     neighbor_list.allocate(positions)
     pairs = neighbor_list.pairs
     pairs = pairs.at[:, :2].set(regularize_pairs(pairs[:, :2]))
     return pairs
 
-
+#@jax.jit
 def ds_pairs(positions, box, pairs):
     pos1 = positions[pairs[:, 0].astype(int)]
     pos2 = positions[pairs[:, 1].astype(int)]
@@ -195,7 +176,7 @@ def generate_get_energy(kappa, K1, K2, K3, pme_order=6):
 
     return get_energy
 
-
+#@jax.jit
 def generate_get_Energy_Qeq_2(
     kappa=4.3804348,
     K1=45,
@@ -207,9 +188,7 @@ def generate_get_Energy_Qeq_2(
 ):
     pme = generate_get_energy(kappa, K1, K2, K3, pme_order=pme_order)
 
-    def get_Energy_Qeq_2(
-        charges, positions, box, pairs, eta, chi, hardness
-    ):
+    def get_Energy_Qeq_2(charges, positions, box, pairs, eta, chi, hardness):
         def get_Energy_PME():
             return pme(
                 positions / 10.0,
@@ -222,28 +201,13 @@ def generate_get_Energy_Qeq_2(
         def get_Energy_Correction():
             distances = ds_pairs(positions, box, pairs)
             buffer_scales = pair_buffer_scales(pairs)
-            pair_eta = jnp.sqrt(
-                eta[pairs[:, 0]] ** 2 + eta[pairs[:, 1]] ** 2
-            )
-            correction_pair = (
-                charges[pairs[:, 0]]
-                * charges[pairs[:, 1]]
-                * erfc(distances / (jnp.sqrt(2.0) * pair_eta))
-                * 1389.35455846
-                / distances
-                * buffer_scales
-            )
-            correction_self = (
-                charges**2
-                * 1389.35455846
-                / (2.0 * jnp.sqrt(jnp.pi) * eta)
-            )
+            pair_eta = jnp.sqrt(eta[pairs[:, 0]] ** 2 + eta[pairs[:, 1]] ** 2)
+            correction_pair = (charges[pairs[:, 0]]* charges[pairs[:, 1]]* erfc(distances / (jnp.sqrt(2.0) * pair_eta))* 1389.35455846/ distances* buffer_scales)
+            correction_self = (charges**2* 1389.35455846/ (2.0 * jnp.sqrt(jnp.pi) * eta))
             return -jnp.sum(correction_pair) + jnp.sum(correction_self)
 
         def get_Energy_Onsite():
-            onsite = (
-                chi * charges + 0.5 * hardness * charges * charges
-            ) * 96.4869
+            onsite = (chi * charges + 0.5 * hardness * charges * charges) * 96.4869
             return jnp.sum(onsite)
 
         def get_dipole_correction():
@@ -264,27 +228,19 @@ def generate_get_Energy_Qeq_2(
     return get_Energy_Qeq_2
 
 
-# Original main_multi.py-compatible energy function.
-get_Energy_Qeq_2 = generate_get_Energy_Qeq_2()
+get_Energy_Qeq = generate_get_Energy_Qeq_2()
 
 
 def fn_value_and_proj_grad(func, constraint_matrix, has_aux=False):
     def value_and_proj_grad(*args, **kwargs):
-        value, gradient = jax.value_and_grad(func, has_aux=has_aux)(
-            *args, **kwargs
-        )
-        constraint_gradient = jnp.matmul(
-            constraint_matrix, gradient.reshape(-1, 1)
-        )
-        constraint_norm = jnp.sum(
-            constraint_matrix * constraint_matrix,
-            axis=1,
-            keepdims=True,
-        )
-        removed_gradient = jnp.matmul(
-            (constraint_gradient / constraint_norm).T,
-            constraint_matrix,
-        )
+        value, gradient = jax.value_and_grad(func, has_aux=has_aux)(*args, **kwargs)
+        #n * 1
+        constraint_gradient = jnp.matmul(constraint_matrix, gradient.reshape(-1, 1))
+        #n * 1
+        constraint_norm = jnp.sum(constraint_matrix * constraint_matrix,axis=1,keepdims=True)
+        #1*N
+        removed_gradient = jnp.matmul((constraint_gradient / constraint_norm).T,constraint_matrix)
+        #N
         projected_gradient = gradient - removed_gradient.reshape(-1)
         return value, projected_gradient
 
@@ -293,9 +249,7 @@ def fn_value_and_proj_grad(func, constraint_matrix, has_aux=False):
 
 def generate_solve_q_pg(energy_fn, tol=1.0e-6, maxiter=500):
     def projected_energy(charges, *energy_args):
-        value, gradient = jax.value_and_grad(energy_fn)(
-            charges, *energy_args
-        )
+        value, gradient = jax.value_and_grad(energy_fn)(charges, *energy_args)
         projected_gradient = gradient - jnp.mean(gradient)
         return value, projected_gradient
 
@@ -306,30 +260,11 @@ def generate_solve_q_pg(energy_fn, tol=1.0e-6, maxiter=500):
         maxiter=maxiter,
     )
 
-    def solve_q_pg(
-        charges,
-        positions,
-        box,
-        pairs,
-        eta,
-        chi,
-        hardness,
-        return_state=False,
-    ):
+    def solve_q_pg(charges,positions,box,pairs,eta,chi,hardness,return_state=False):
         total_charge = jnp.sum(charges)
-        result = solver.run(
-            charges,
-            positions,
-            box,
-            pairs,
-            eta,
-            chi,
-            hardness,
-        )
+        result = solver.run(charges,positions,box,pairs,eta,chi,hardness,)
         optimized_charges = result.params
-        optimized_charges += (
-            total_charge - jnp.sum(optimized_charges)
-        ) / optimized_charges.shape[0]
+        optimized_charges += ( total_charge - jnp.sum(optimized_charges)) / optimized_charges.shape[0]
         if return_state:
             return optimized_charges, result.state
         return optimized_charges
@@ -338,7 +273,7 @@ def generate_solve_q_pg(energy_fn, tol=1.0e-6, maxiter=500):
 
 
 # Original main_multi.py-compatible projected-gradient charge solver.
-solve_q_pg = generate_solve_q_pg(get_Energy_Qeq_2)
+solve_q_pg = generate_solve_q_pg(get_Energy_Qeq)
 
 
 @dataclass(frozen=True)
@@ -569,17 +504,9 @@ class JAXQEqModel:
         }
 
     def _neighbor_pairs(self, positions: np.ndarray, box: np.ndarray):
-        return get_neighbor_list(
-            box,
-            self.r_cut,
-            positions,
-            len(positions),
-            padding=self.max_pairs > 0,
-            max_shape=self.max_pairs,
-        )
+        return get_neighbor_list(box,self.r_cut,positions,len(positions),padding=self.max_pairs > 0,max_shape=self.max_pairs)
 
     def reset_charge_state(self) -> None:
-        """Forget the warm-start charges and force the next frame through KKT."""
         self.charge_list.clear()
         self.last_charge_solver = None
         self.last_pg_iterations = None
@@ -587,9 +514,7 @@ class JAXQEqModel:
         self._charge_symbols = None
         self._charge_total = None
 
-    def _has_compatible_charge_state(
-        self, symbols: Sequence[str], total_charge: float
-    ) -> bool:
+    def _has_compatible_charge_state(self, symbols: Sequence[str], total_charge: float) -> bool:
         return (
             len(self.charge_list) == len(symbols)
             and self._charge_symbols == tuple(symbols)
@@ -597,15 +522,9 @@ class JAXQEqModel:
             and abs(self._charge_total - total_charge) <= 1.0e-8
         )
 
-    def _solve_charges_matrix(
-        self, total_charge, positions, box, pairs, eta, chi, hardness
-    ):
+    def _solve_charges_matrix(self, total_charge, positions, box, pairs, eta, chi, hardness):
         n_atoms = positions.shape[0]
-        charges = self.jnp.full(
-            n_atoms,
-            total_charge / n_atoms,
-            dtype=positions.dtype,
-        )
+        charges = self.jnp.full(n_atoms,total_charge / n_atoms,dtype=positions.dtype)
 
         def energy_for_q(q):
             return self.get_Energy_Qeq_2(
@@ -637,51 +556,23 @@ class JAXQEqModel:
                 ]
             )
             charge_error = total_charge - self.jnp.sum(charges)
-            rhs = self.jnp.concatenate(
-                (-gradient, self.jnp.asarray([charge_error]))
-            )
+            rhs = self.jnp.concatenate((-gradient, self.jnp.asarray([charge_error])))
             update = self.jnp.linalg.solve(kkt_matrix, rhs)[:n_atoms]
             charges += update
 
-        charges += (
-            total_charge - self.jnp.sum(charges)
-        ) / n_atoms
+        charges += (total_charge - self.jnp.sum(charges)) / n_atoms
         return charges
 
-    def _solve_charges(
-        self,
-        total_charge,
-        symbols,
-        positions,
-        box,
-        pairs,
-        eta,
-        chi,
-        hardness,
-    ):
-        use_projected_gradient = (
-            self.solver_mode == "hybrid"
-            and self._has_compatible_charge_state(symbols, total_charge)
-        )
+    def _solve_charges(self,total_charge,symbols,positions,box,pairs,eta,chi,hardness):
+        use_projected_gradient = (self.solver_mode == "hybrid"and self._has_compatible_charge_state(symbols, total_charge))
         if not use_projected_gradient:
-            charges = self._solve_charges_matrix(
-                total_charge, positions, box, pairs, eta, chi, hardness
-            )
+            charges = self._solve_charges_matrix(total_charge, positions, box, pairs, eta, chi, hardness)
             return charges, "matrix", None, None
 
         initial_charges = self.jnp.asarray(
             self.charge_list, dtype=positions.dtype
         )
-        charges, state = self.solve_q_pg(
-            initial_charges,
-            positions,
-            box,
-            pairs,
-            eta,
-            chi,
-            hardness,
-            return_state=True,
-        )
+        charges, state = self.solve_q_pg(initial_charges,positions,box,pairs,eta,chi,hardness,return_state=True)
         iterations = int(np.asarray(state.iter_num))
         error = float(np.asarray(state.error))
         acceptable_error = max(10.0 * self.pg_tolerance, 1.0e-5)
@@ -709,13 +600,10 @@ class JAXQEqModel:
         self.last_pg_error = pg_error
 
     def calculate(self, atoms, total_charge: float) -> QEqResult:
-
         symbols = atoms.get_chemical_symbols()
         parameters = self.predict_parameters(atoms)
         positions_np = np.asarray(atoms.get_positions(), dtype=self.np_dtype)
         box_np = np.asarray(atoms.get_cell(), dtype=self.np_dtype)
-        if box_np.shape != (3, 3) or abs(np.linalg.det(box_np)) < 1.0e-12:
-            raise ValueError("JAX QEq PME requires a non-singular 3x3 cell")
         positions = self.jnp.asarray(positions_np, dtype=self.jax_dtype)
         box = self.jnp.asarray(box_np, dtype=self.jax_dtype)
         pairs = self._neighbor_pairs(positions_np, box_np)
@@ -733,9 +621,7 @@ class JAXQEqModel:
             hardness,
         )
 
-        energy, gradient = self.jax.value_and_grad(
-            self.get_Energy_Qeq_2, argnums=1
-        )(charges, positions, box, pairs, eta, chi, hardness)
+        energy, gradient = self.jax.value_and_grad(self.get_Energy_Qeq_2, argnums=1)(charges, positions, box, pairs, eta, chi, hardness)
         forces = -gradient
 
         result = QEqResult(

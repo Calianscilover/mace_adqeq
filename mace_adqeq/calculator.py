@@ -63,7 +63,6 @@ class MACEJAXQEqCalculator(Calculator):
         )
 
     def reset_charge_state(self) -> None:
-        """Force the next QEq calculation to use the matrix solver."""
         self.qeq_model.reset_charge_state()
 
     def _get_total_charge(self, atoms) -> float:

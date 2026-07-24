@@ -1,102 +1,181 @@
-from types import SimpleNamespace
+import os
+from pathlib import Path
 
+# This must be set before importing JAX or mace_adqeq.
+os.environ.setdefault("JAX_PLATFORM_NAME", "gpu")
+os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+
+import jax
 import numpy as np
-from ase import Atoms
-from ase.calculators.calculator import Calculator
+import pytest
+import torch
+from ase.io import read
 
-import mace_adqeq.calculator as calculator_module
 from mace_adqeq import MACEJAXQEqCalculator
 
 
-class FakeMACECalculator(Calculator):
-    implemented_properties = ["energy", "forces"]
-    init_kwargs = None
+ROOT = Path(__file__).resolve().parents[1]
+DATA = ROOT / "data"
+STRUCTURE = DATA / "STRU-2.pdb"
+MACE_MODEL = DATA / "interface.model"
+QEQ_PARAMS = DATA / "qeq_multihead_params.msgpack"
+QEQ_CONFIG = DATA / "qeq_multihead_config.json"
 
-    def __init__(self, **kwargs):
-        super().__init__()
-        type(self).init_kwargs = kwargs
-
-    def calculate(self, atoms=None, properties=None, system_changes=None):
-        self.results = {
-            "energy": 2.5,
-            "forces": np.full((len(atoms), 3), 0.25),
-        }
+TOTAL_CHARGE = float(os.environ.get("MACE_ADQEQ_TOTAL_CHARGE", "0.0"))
+MAX_PAIRS = int(os.environ.get("MACE_ADQEQ_MAX_PAIRS", "0"))
 
 
-class FakeQEqModel:
-    init_kwargs = None
-
-    def __init__(self, **kwargs):
-        type(self).init_kwargs = kwargs
-
-    def calculate(self, atoms, total_charge):
-        n_atoms = len(atoms)
-        charges = np.full(n_atoms, total_charge / n_atoms)
-        return SimpleNamespace(
-            energy=1.5,
-            forces=np.full((n_atoms, 3), -0.1),
-            charges=charges,
-            chi=np.arange(n_atoms, dtype=float),
-            hardness=np.full(n_atoms, 2.0),
-            eta=np.full(n_atoms, 1.0),
-        )
+def _assert_finite(name: str, value) -> None:
+    array = np.asarray(value)
+    assert np.all(np.isfinite(array)), f"{name} contains NaN or Inf"
 
 
-def make_calculator(monkeypatch, **kwargs):
-    monkeypatch.setattr(
-        calculator_module, "MACECalculator", FakeMACECalculator
+def _assert_cuda_backends() -> None:
+    assert torch.cuda.is_available(), (
+        "PyTorch cannot access CUDA. Run this test on a GPU node with a "
+        "CUDA-enabled PyTorch installation."
     )
-    monkeypatch.setattr(calculator_module, "JAXQEqModel", FakeQEqModel)
-    return MACEJAXQEqCalculator(
-        mace_model_path="mace.model",
-        qeq_params_path="qeq.msgpack",
-        qeq_config_path="qeq.json",
-        **kwargs,
+    assert jax.default_backend() == "gpu", (
+        f"JAX backend is {jax.default_backend()!r}, expected 'gpu'. "
+        "Install a CUDA-enabled jaxlib/JAX plugin and request a GPU node."
+    )
+    assert any(device.platform == "gpu" for device in jax.devices()), (
+        f"JAX did not report a GPU device: {jax.devices()}"
     )
 
 
-def test_combines_mace_and_qeq_results(monkeypatch):
-    atoms = Atoms("HO", positions=[[0, 0, 0], [0, 0, 1]], cell=[10, 10, 10])
-    atoms.info["total_charge"] = 1.0
-    atoms.calc = make_calculator(monkeypatch)
-
-    assert atoms.get_potential_energy() == 4.0
-    np.testing.assert_allclose(atoms.get_forces(), 0.15)
-    np.testing.assert_allclose(atoms.calc.results["partial_charges"], [0.5, 0.5])
-    assert atoms.calc.results["short_range_energy"] == 2.5
-    assert atoms.calc.results["long_range_energy"] == 1.5
+def _assert_data_files() -> None:
+    for path in (STRUCTURE, MACE_MODEL, QEQ_PARAMS, QEQ_CONFIG):
+        assert path.is_file(), f"Required integration-test file is missing: {path}"
+        assert path.stat().st_size > 0, f"Integration-test file is empty: {path}"
 
 
-def test_constructs_official_mace_and_qeq_models(monkeypatch):
-    calculator = make_calculator(
-        monkeypatch,
-        mace_device="cpu",
-        mace_default_dtype="float64",
-        qeq_options={"dipole_axis": 2},
+def _assert_result_shapes_and_values(atoms) -> None:
+    results = atoms.calc.results
+    n_atoms = len(atoms)
+
+    assert np.asarray(results["forces"]).shape == (n_atoms, 3)
+    assert np.asarray(results["charges"]).shape == (n_atoms,)
+    assert np.asarray(results["chi"]).shape == (n_atoms,)
+    assert np.asarray(results["hardness"]).shape == (n_atoms,)
+    assert np.asarray(results["eta"]).shape == (n_atoms,)
+
+    for name in (
+        "energy",
+        "forces",
+        "charges",
+        "short_range_energy",
+        "long_range_energy",
+        "short_range_forces",
+        "long_range_forces",
+        "chi",
+        "hardness",
+        "eta",
+    ):
+        _assert_finite(name, results[name])
+
+    np.testing.assert_allclose(
+        results["energy"],
+        results["short_range_energy"] + results["long_range_energy"],
+        rtol=1.0e-6,
+        atol=1.0e-6,
+    )
+    np.testing.assert_allclose(
+        results["forces"],
+        results["short_range_forces"] + results["long_range_forces"],
+        rtol=1.0e-6,
+        atol=1.0e-6,
+    )
+    np.testing.assert_allclose(
+        np.sum(results["charges"]),
+        TOTAL_CHARGE,
+        rtol=0.0,
+        atol=5.0e-4,
     )
 
-    assert isinstance(calculator.mace_calculator, FakeMACECalculator)
-    assert isinstance(calculator.qeq_model, FakeQEqModel)
-    assert FakeMACECalculator.init_kwargs["device"] == "cpu"
-    assert FakeMACECalculator.init_kwargs["default_dtype"] == "float64"
-    assert FakeQEqModel.init_kwargs["dipole_axis"] == 2
+
+def _print_summary(frame: str, atoms) -> None:
+    results = atoms.calc.results
+    forces = np.asarray(results["forces"])
+    charges = np.asarray(results["charges"])
+    print(
+        f"{frame}: "
+        f"energy={results['energy']:.12g} eV, "
+        f"max_force={np.linalg.norm(forces, axis=1).max():.12g} eV/A, "
+        f"charge_sum={charges.sum():.12g} e, "
+        f"solver={results['qeq_solver']}, "
+        f"pg_iterations={results['qeq_pg_iterations']}, "
+        f"pg_error={results['qeq_pg_error']}"
+    )
 
 
-def test_requires_explicit_total_charge(monkeypatch):
-    atoms = Atoms("H", positions=[[0, 0, 0]], cell=[10, 10, 10])
-    atoms.calc = make_calculator(monkeypatch)
+@pytest.mark.integration
+@pytest.mark.cuda
+def test_real_cuda_calculator_and_hybrid_charge_solver():
+    """Validate real models and the matrix -> projected-gradient MD flow."""
+    _assert_cuda_backends()
+    _assert_data_files()
+    print(f"PyTorch CUDA device: {torch.cuda.get_device_name(0)}")
+    print(f"JAX devices: {jax.devices()}")
 
-    try:
-        atoms.get_potential_energy()
-    except ValueError as exc:
-        assert "total_charge" in str(exc)
-    else:
-        raise AssertionError("Expected missing total_charge to raise ValueError")
+    atoms = read(STRUCTURE)
+    assert len(atoms) == 288
+    assert np.any(atoms.get_pbc()), "The QEq PME test structure must be periodic"
+    atoms.info["total_charge"] = TOTAL_CHARGE
 
+    atoms.calc = MACEJAXQEqCalculator(
+        mace_model_path=MACE_MODEL,
+        qeq_params_path=QEQ_PARAMS,
+        qeq_config_path=QEQ_CONFIG,
+        mace_device="cuda",
+        mace_default_dtype="float32",
+        qeq_options={
+            "solver_mode": "hybrid",
+            "max_pairs": MAX_PAIRS,
+            "pg_tolerance": 1.0e-6,
+            "pg_max_iterations": 500,
+            "matrix_tolerance": 1.0e-8,
+            "matrix_max_iterations": 8,
+        },
+    )
 
-def test_default_total_charge(monkeypatch):
-    atoms = Atoms("H2", positions=[[0, 0, 0], [0, 0, 1]], cell=[10, 10, 10])
-    atoms.calc = make_calculator(monkeypatch, default_total_charge=-1.0)
+    # First frame: constrained Newton-KKT matrix solve.
+    first_energy = atoms.get_potential_energy()
+    first_forces = atoms.get_forces()
+    _assert_finite("first_energy", first_energy)
+    _assert_finite("first_forces", first_forces)
+    _assert_result_shapes_and_values(atoms)
+    _print_summary("first_frame", atoms)
+    assert atoms.calc.results["qeq_solver"] == "matrix"
+    assert len(atoms.calc.qeq_model.charge_list) == len(atoms)
 
-    assert atoms.get_potential_energy() == 4.0
-    np.testing.assert_allclose(atoms.calc.results["charges"], [-0.5, -0.5])
+    charge_list_id = id(atoms.calc.qeq_model.charge_list)
+
+    # Next MD-like frame: reuse the previous charges as the projected-LBFGS
+    # initial state. The small displacement forces ASE to recalculate.
+    atoms.positions[0, 0] += 1.0e-3
+    second_energy = atoms.get_potential_energy()
+    second_forces = atoms.get_forces()
+    _assert_finite("second_energy", second_energy)
+    _assert_finite("second_forces", second_forces)
+    _assert_result_shapes_and_values(atoms)
+    _print_summary("second_frame", atoms)
+
+    results = atoms.calc.results
+    assert results["qeq_solver"] == "projected_gradient", (
+        "The second frame did not converge with projected LBFGS; "
+        f"solver={results['qeq_solver']!r}, "
+        f"iterations={results['qeq_pg_iterations']!r}, "
+        f"error={results['qeq_pg_error']!r}"
+    )
+    assert 0 < results["qeq_pg_iterations"] <= 500
+    assert results["qeq_pg_error"] <= 1.0e-5
+
+    second_charges = np.asarray(results["charges"])
+    np.testing.assert_allclose(
+        np.asarray(atoms.calc.qeq_model.charge_list),
+        second_charges,
+        rtol=0.0,
+        atol=0.0,
+    )
+    assert id(atoms.calc.qeq_model.charge_list) == charge_list_id
