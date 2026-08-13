@@ -21,7 +21,7 @@ MACE_MODEL = DATA / "interface.model"
 QEQ_PARAMS = DATA / "qeq_multihead_params.msgpack"
 QEQ_CONFIG = DATA / "qeq_multihead_config.json"
 
-TOTAL_CHARGE = float(os.environ.get("MACE_ADQEQ_TOTAL_CHARGE", "0.0"))
+TOTAL_CHARGE = 0.0
 MAX_PAIRS = int(os.environ.get("MACE_ADQEQ_MAX_PAIRS", "0"))
 
 
@@ -121,8 +121,6 @@ def test_real_cuda_calculator_and_hybrid_charge_solver():
     atoms = read(STRUCTURE)
     assert len(atoms) == 288
     assert np.any(atoms.get_pbc()), "The QEq PME test structure must be periodic"
-    atoms.info["total_charge"] = TOTAL_CHARGE
-
     atoms.calc = MACEJAXQEqCalculator(
         mace_model_path=MACE_MODEL,
         qeq_params_path=QEQ_PARAMS,
