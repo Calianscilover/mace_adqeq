@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Optional
 
@@ -7,15 +8,14 @@ import numpy as np
 from ase.calculators.calculator import Calculator, all_changes
 from mace.calculators import MACECalculator
 
-from .qeq import JAXQEqModel
+from .qeq import JAXQEqModel, QEqParameterPredictor
 
 
 class MACEJAXQEqCalculator(Calculator):
 
-    name = "MACEJAXQEq"
+    name = "MACE-ADQEq"
     implemented_properties = [
         "energy",
-        "free_energy",
         "forces",
         "charges",
         "partial_charges",
@@ -37,16 +37,12 @@ class MACEJAXQEqCalculator(Calculator):
         mace_device: str = "cuda",
         mace_default_dtype: str = "float32",
         mace_compile_mode=None,
-        total_charge_key: str = "total_charge",
-        default_total_charge: Optional[float] = None,
         qeq_options: Optional[dict] = None,
         mode : int = 0,
         const_potential : bool = False,
         **kwargs,
     ) -> None:
         super().__init__(**kwargs)
-        self.total_charge_key = str(total_charge_key)
-        self.default_total_charge = default_total_charge
         self.mode = mode
         self.const_potential = const_potential
 
@@ -56,24 +52,38 @@ class MACEJAXQEqCalculator(Calculator):
             default_dtype=mace_default_dtype,
             compile_mode=mace_compile_mode,
         )
-        self.qeq_model = JAXQEqModel(
+        qeq_config_path = Path(qeq_config_path).expanduser().resolve()
+        config = json.loads(qeq_config_path.read_text(encoding="utf-8"))
+        if "qeq" not in config:
+            descriptor = config.get("features", {}).get("descriptor", "unknown")
+            raise ValueError(
+                f"{qeq_config_path} does not contain a 'qeq' section "
+                f"(descriptor={descriptor!r}). Use the MACE-QEq configuration "
+                "that was written with the current parameter checkpoint."
+            )
+        qeq_config = config["qeq"]
+
+        self.parameter_predictor = QEqParameterPredictor(
             params_path=qeq_params_path,
             config_path=qeq_config_path,
-            **(qeq_options or {}),
+            mace_device=mace_device,
         )
+
+        model_options = {
+            "cutoff": float(qeq_config["cutoff"]),
+            "pme_grid": tuple(qeq_config["pme_grid"]),
+            "jitter": float(qeq_config["jitter"]),
+            "max_pairs": 30000,
+            "solver_mode": "hybrid",
+            "pg_method": "cg",
+            "dtype": "float64",
+            "const_potential": self.const_potential,
+        }
+        model_options.update(qeq_options or {})
+        self.qeq_model = JAXQEqModel(**model_options)
 
     def reset_charge_state(self) -> None:
         self.qeq_model.reset_charge_state()
-
-    def _get_total_charge(self, atoms) -> float:
-        if self.total_charge_key in atoms.info:
-            return float(atoms.info[self.total_charge_key])
-        if self.default_total_charge is not None:
-            return float(self.default_total_charge)
-        raise ValueError(
-            f"Missing atoms.info[{self.total_charge_key!r}]; set it or "
-            "provide default_total_charge"
-        )
 
     def calculate(self, atoms=None, properties=None, system_changes=all_changes) -> None:
         super().calculate(atoms, properties, system_changes)
@@ -87,8 +97,12 @@ class MACEJAXQEqCalculator(Calculator):
         mace_energy = float(mace_results["energy"])
         mace_forces = np.asarray(mace_results["forces"], dtype=float)
 
-        total_charge = self._get_total_charge(atoms)
-        qeq_result = self.qeq_model.calculate(atoms, total_charge=total_charge)
+        qeq_result = self.qeq_model.calculate(
+            atoms,
+            predictor=self.parameter_predictor,
+            total_charge=0.0,
+            compute_forces=True,
+        )
         qeq_energy = float(qeq_result.energy)
         qeq_forces = np.asarray(qeq_result.forces, dtype=float)
 
@@ -110,7 +124,6 @@ class MACEJAXQEqCalculator(Calculator):
 
         self.results = {
             "energy": total_energy,
-            "free_energy": total_energy,
             "forces": total_forces,
             "charges": charges,
             "partial_charges": charges,
