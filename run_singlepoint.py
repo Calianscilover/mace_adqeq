@@ -31,8 +31,8 @@ def parse_args():
         "--dipole-axis",
         type=int,
         choices=(0, 1, 2),
-        default=1,
-        help="Axis used by the checkpoint's slab dipole correction (training code used 1).",
+        default=2,
+        help="Axis of the slab dipole correction (the non-periodic electrode normal, z).",
     )
     parser.add_argument("--output", default="combined_singlepoint.extxyz")
     return parser.parse_args()

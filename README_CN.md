@@ -42,11 +42,11 @@ MACE 没有被嵌入 JAX，也不需要参与 QEq 求解。`MACEJAXQEqCalculator
 6. 对电荷二次型构造 KKT 方程，在 `sum(q_i) = Q_total` 约束下直接求解电荷。
 7. 对坐标求梯度得到 QEq 力，最后与短程模型结果相加。
 
-为保持现有 checkpoint 行为，当前 `eta` 仍使用元素基线；虽然网络包含 eta head，但原训练脚本实际没有启用其预测值。偶极修正默认使用坐标轴 `1`（y），因为原代码虽然变量名为 `Mz`，实际写的是 `positions[:, 1]`。
+为保持现有 checkpoint 行为，当前 `eta` 仍使用元素基线；虽然网络包含 eta head，但原训练脚本实际没有启用其预测值。slab 偶极修正统一使用 z 轴（`dipole_axis=2`，即电极法向的非周期方向），`JAXQEqModel` 和所有脚本的默认值都是 `2`。
 
 QEq 默认使用 `solver_mode="hybrid"`：第一帧通过迭代
 Newton-KKT 矩阵法获得严格约束的自洽电荷，之后每帧以上一帧电荷为初值，
-使用投影 LBFGS 求解。原子数、元素顺序或总电荷发生变化时会自动回到矩阵法。
+使用投影共轭梯度（`pg_method="cg"`，默认）或投影 LBFGS 求解。原子数、元素顺序或总电荷发生变化时会自动回到矩阵法。
 如需每帧都使用矩阵法，可设置：
 
 ```python
@@ -71,7 +71,9 @@ python run_singlepoint.py \
   --mace-device cuda
 ```
 
-`--total-charge 0` 只是命令示例。实际运行时必须填写完整模拟胞的真实总电荷，不能根据某一组 Zn 原子的电荷符号猜测。
+`MACEJAXQEqCalculator` 固定按总电荷 0 求解，只适用于电中性体系；`atoms.info["total_charge"]` 和 `run_singlepoint.py` 的 `--total-charge` 不会改变 calculator 的求解结果。
+
+正式生产 MD 前的验证步骤见 `validation/fd_test.md`。
 
 在当前 `py3.9` 环境中可先独立验证 QEq，并列出前 93 个 Zn 中电荷为负的原子序号：
 
