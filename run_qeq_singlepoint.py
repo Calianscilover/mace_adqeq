@@ -24,7 +24,7 @@ def parse_args():
         required=True,
     )
     parser.add_argument("--total-charge", type=float, required=True)
-    parser.add_argument("--dipole-axis", type=int, choices=(0, 1, 2), default=1)
+    parser.add_argument("--dipole-axis", type=int, choices=(0, 1, 2), default=2)
     parser.add_argument("--report-first", type=int, default=93)
     parser.add_argument("--output", default="qeq_singlepoint.extxyz")
     return parser.parse_args()

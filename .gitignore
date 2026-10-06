@@ -13,3 +13,8 @@ mace-scf/
 *.model
 *.msgpack
 *.extxyz
+
+# Validation inputs and outputs (see validation/fd_test.md)
+validation/jax_model/
+validation/fd_results/
+validation/*.json
