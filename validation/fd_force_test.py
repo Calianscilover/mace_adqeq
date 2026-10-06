@@ -20,9 +20,16 @@ deterministic and its energy noise swamps the parameter response. Use
 --device cuda --mace-dtype float32 or --solver-mode hybrid to quantify the
 production noise; the PASS/FAIL thresholds below are meant for the defaults.
 
+The real-space QEq terms are truncated at the cutoff without smoothing, so a pair
+crossing it between the +/- geometries adds an energy step that does not vanish
+with the step size. Such rows are flagged, reported with their implied energy
+jump, and excluded from the error statistics; the energy-scan fit gets one step
+term per interval in which the QEq neighbor list changes.
+
 The run ends with PASS/FAIL checks (determinism, frozen and whole force vs
 finite differences at the best step, parameter response, energy scan, net
-force, electrode assignment) and exits with status 1 if any check fails.
+force, electrode assignment) and exits with status 1 if any check fails. A
+failure within 3x the measured energy-noise floor is marked noise-limited.
 See validation/fd_test.md for the full pre-production checklist.
 
 有限差分测试通过是必要条件，但不是充分条件。
@@ -51,6 +58,7 @@ sys.path.insert(0, str(ROOT))
 
 import numpy as np
 from ase.io import read
+from dmff.utils import pair_buffer_scales
 from mace_adqeq.const_potential import identify_electrode_atoms
 from mace_adqeq.qeq import JAXQEqModel, QEqParameterPredictor
 
@@ -58,6 +66,16 @@ STRUCTURE = HERE / "pair_revised_equilibrated.extxyz"
 PARAMS = HERE / "jax_model" / "qeq_mace_chi_hardness_eta_params.msgpack"
 CONFIG = HERE / "jax_model" / "qeq_mace_chi_hardness_eta_config.json"
 AXES = "xyz"
+SUMMARY_KEYS = (
+    "whole_vs_fd_full_mae",
+    "whole_vs_fd_full_max",
+    "frozen_vs_fd_full_mae",
+    "frozen_vs_fd_full_max",
+    "frozen_vs_fd_frozen_mae",
+    "frozen_vs_fd_frozen_max",
+    "response_analytic_mean_abs",
+    "response_fd_minus_analytic_mae",
+)
 
 
 def parse_args():
@@ -142,12 +160,25 @@ def select_atoms(atoms, response_norm, top_response):
     return selected
 
 
-def fit_scan(alphas, energies, degree=4):
-    """Return (-dE/dalpha at 0, RMS residual) from a polynomial fit of a 1D energy scan."""
+def fit_scan(alphas, energies, jump_positions=(), degree=4):
+    """Fit a 1D energy scan with a polynomial plus one step per QEq neighbor-list change.
+
+    Returns (-dE/dalpha at 0, RMS residual, standard error of the slope); all None when
+    there are too many neighbor-list changes for the number of scan points.
+    """
     shifted = energies - energies[len(energies) // 2]
-    coefficients = np.polyfit(alphas, shifted, degree)
-    residual = shifted - np.polyval(coefficients, alphas)
-    return -float(coefficients[-2]), float(np.sqrt(np.mean(residual**2)))
+    columns = [alphas**power for power in range(degree + 1)]
+    columns += [(alphas > position).astype(float) for position in jump_positions]
+    design = np.stack(columns, axis=1)
+    dof = len(alphas) - design.shape[1]
+    if dof <= 0:
+        return None, None, None
+    coefficients = np.linalg.lstsq(design, shifted, rcond=None)[0]
+    residual = shifted - design @ coefficients
+    rms = float(np.sqrt(np.mean(residual**2)))
+    sigma2 = float(residual @ residual) / dof
+    slope_std = float(np.sqrt(sigma2 * np.linalg.pinv(design.T @ design)[1, 1]))
+    return -float(coefficients[1]), rms, slope_std
 
 
 def write_csv(path, rows):
@@ -160,10 +191,16 @@ def write_csv(path, rows):
 
 
 def summarize(rows, steps):
+    """Error statistics per step over the rows whose ± geometries share the QEq neighbor list."""
     summary = {}
     for step in steps:
-        subset = [row for row in rows if row["step"] == step]
+        all_rows = [row for row in rows if row["step"] == step]
+        if not all_rows:
+            continue
+        subset = [row for row in all_rows if not row["cutoff_crossed"]]
+        counts = {"n": len(all_rows), "n_clean": len(subset), "n_cutoff_crossed": len(all_rows) - len(subset)}
         if not subset:
+            summary[str(step)] = {**counts, **dict.fromkeys(SUMMARY_KEYS)}
             continue
         err_whole = np.array([row["whole"] - row["fd_full"] for row in subset])
         err_frozen_full = np.array([row["frozen"] - row["fd_full"] for row in subset])
@@ -171,7 +208,7 @@ def summarize(rows, steps):
         analytic_response = np.array([row["whole"] - row["frozen"] for row in subset])
         fd_response = np.array([row["fd_full"] - row["fd_frozen"] for row in subset])
         summary[str(step)] = {
-            "n": len(subset),
+            **counts,
             "whole_vs_fd_full_mae": float(np.mean(np.abs(err_whole))),
             "whole_vs_fd_full_max": float(np.max(np.abs(err_whole))),
             "frozen_vs_fd_full_mae": float(np.mean(np.abs(err_frozen_full))),
@@ -185,53 +222,121 @@ def summarize(rows, steps):
 
 
 def print_summary(title, summary):
-    print(f"\n=== {title} (eV/A) ===")
-    print(f"{'step':>8} {'n':>4} {'whole-fd':>12} {'frozen-fd':>12} {'frozen-fdfrz':>13} {'|resp|':>10} {'resp err':>10}")
+    def fmt(value, width):
+        return f"{'-':>{width}}" if value is None else f"{value:{width}.3e}"
+
+    print(f"\n=== {title}, rows crossing the QEq cutoff excluded (eV/A) ===")
+    print(f"{'step':>8} {'n':>4} {'clean':>5} {'whole-fd':>12} {'frozen-fd':>12} {'frozen-fdfrz':>13} {'|resp|':>10} {'resp err':>10}")
     for step, item in summary.items():
         print(
-            f"{float(step):8.4f} {item['n']:4d} "
-            f"{item['whole_vs_fd_full_mae']:12.3e} {item['frozen_vs_fd_full_mae']:12.3e} "
-            f"{item['frozen_vs_fd_frozen_mae']:13.3e} {item['response_analytic_mean_abs']:10.3e} "
-            f"{item['response_fd_minus_analytic_mae']:10.3e}",
+            f"{float(step):8.4f} {item['n']:4d} {item['n_clean']:5d} "
+            f"{fmt(item['whole_vs_fd_full_mae'], 12)} {fmt(item['frozen_vs_fd_full_mae'], 12)} "
+            f"{fmt(item['frozen_vs_fd_frozen_mae'], 13)} {fmt(item['response_analytic_mean_abs'], 10)} "
+            f"{fmt(item['response_fd_minus_analytic_mae'], 10)}",
+            flush=True,
+        )
+
+
+def print_crossings(title, rows, label):
+    crossed = [row for row in rows if row["cutoff_crossed"]]
+    print(f"\n=== {title}: {len(crossed)} of {len(rows)} rows cross the QEq cutoff (excluded above) ===", flush=True)
+    if crossed:
+        print(f"{'row':<34s} {'step':>7} {'pairs':>5} {'jump_frozen eV':>15} {'jump_full eV':>13}", flush=True)
+    for row in crossed:
+        print(
+            f"{label(row):<34s} {row['step']:7.4f} {row['pairs_changed']:5d} "
+            f"{row['implied_jump_frozen']:15.3e} {row['implied_jump_full']:13.3e}",
             flush=True,
         )
 
 
 def best_step(summary, key):
-    return min(item[key] for item in summary.values())
+    """(smallest value of key over the steps, its step); (None, None) if no step has clean rows."""
+    values = [(item[key], float(step)) for step, item in summary.items() if item[key] is not None]
+    return min(values) if values else (None, None)
+
+
+def make_check(name, value, threshold, floor=None, note=""):
+    """A check is SKIP without a value and FAIL above threshold; a FAIL within 3x the
+    energy-noise floor is marked noise-limited, i.e. not resolvable with this noise."""
+    if value is None:
+        status, note = "SKIP", note or "no rows without a QEq cutoff crossing"
+    elif value <= threshold:
+        status = "PASS"
+    else:
+        status = "FAIL"
+        if floor is not None and value <= 3.0 * floor:
+            note = f"noise-limited: {value / floor:.1f}x the noise floor {floor:.1e}"
+    return {"name": name, "value": value, "threshold": threshold, "status": status, "note": note}
 
 
 def evaluate_checks(args, repeat_spread, component_summary, directional_summary, scan_summary, net_force, electrode_changes):
-    """Return a list of (name, value, threshold, passed) for the validation criteria."""
+    """Validation criteria; FD statistics exclude rows whose ± geometries differ in the QEq neighbor list."""
+    noise_full = max((item["noise_rms_full"] for item in scan_summary.values() if item["noise_rms_full"] is not None), default=None)
+
+    def fd_floor(step):
+        # Two independent energy errors of RMS noise_full in a central difference of width 2*step.
+        return None if noise_full is None or step is None else np.sqrt(2.0) * noise_full / (2.0 * step)
+
     checks = [
-        (f"repeat spread {name} (eV)", spread, args.repeat_tol)
+        make_check(f"repeat spread {name} (eV)", spread, args.repeat_tol)
         for name, spread in repeat_spread.items()
         if spread is not None
     ]
     for label, summary in (("components", component_summary), ("directional", directional_summary)):
-        checks.append((f"{label}: frozen vs fd_frozen, best step (eV/A)", best_step(summary, "frozen_vs_fd_frozen_mae"), args.frozen_tol))
-        checks.append((f"{label}: whole vs fd_full, best step (eV/A)", best_step(summary, "whole_vs_fd_full_mae"), args.whole_tol))
-        response = max(item["response_analytic_mean_abs"] for item in summary.values())
-        if response > 0.0:
-            ratio = best_step(summary, "response_fd_minus_analytic_mae") / response
-            checks.append((f"{label}: response error / |response|, best step", ratio, args.response_ratio))
+        value, _ = best_step(summary, "frozen_vs_fd_frozen_mae")
+        checks.append(make_check(f"{label}: frozen vs fd_frozen, best step (eV/A)", value, args.frozen_tol))
+        value, step = best_step(summary, "whole_vs_fd_full_mae")
+        checks.append(make_check(f"{label}: whole vs fd_full, best step (eV/A)", value, args.whole_tol, fd_floor(step)))
+        responses = [item["response_analytic_mean_abs"] for item in summary.values() if item["response_analytic_mean_abs"] is not None]
+        error, step = best_step(summary, "response_fd_minus_analytic_mae")
+        if responses and max(responses) > 0.0:
+            response = max(responses)
+            floor = fd_floor(step)
+            checks.append(
+                make_check(
+                    f"{label}: response error / |response|, best step",
+                    None if error is None else error / response,
+                    args.response_ratio,
+                    None if floor is None else floor / response,
+                )
+            )
     for name, item in scan_summary.items():
-        checks.append((f"scan {name}: |fit_full - whole| (eV/A)", abs(item["fit_full"] - item["whole"]), args.whole_tol))
-        checks.append((f"scan {name}: |fit_frozen - frozen| (eV/A)", abs(item["fit_frozen"] - item["frozen"]), args.whole_tol))
+        for kind, analytic in (("full", "whole"), ("frozen", "frozen")):
+            fit = item[f"fit_{kind}"]
+            checks.append(
+                make_check(
+                    f"scan {name}: |fit_{kind} - {analytic}| (eV/A)",
+                    None if fit is None else abs(fit - item[analytic]),
+                    args.whole_tol,
+                    item[f"slope_std_{kind}"],
+                    "" if fit is not None else "too many QEq neighbor-list changes for the scan fit",
+                )
+            )
     for name, vector in net_force.items():
-        checks.append((f"|net force {name}| (eV/A)", float(np.linalg.norm(vector)), args.net_force_tol))
+        checks.append(make_check(f"|net force {name}| (eV/A)", float(np.linalg.norm(vector)), args.net_force_tol))
     if args.const_potential:
-        checks.append(("electrode assignment changes", float(len(electrode_changes)), 0.0))
-    return [(name, value, threshold, value <= threshold) for name, value, threshold in checks]
+        checks.append(make_check("electrode assignment changes", float(len(electrode_changes)), 0.0))
+    return checks
 
 
 def print_checks(checks):
     print("\n=== PASS/FAIL ===", flush=True)
-    for name, value, threshold, passed in checks:
-        print(f"  {'PASS' if passed else 'FAIL'}  {name:<62s} {value:11.3e}  <= {threshold:.1e}", flush=True)
-    failed = sum(not passed for *_, passed in checks)
-    print(f"overall: {'PASS' if failed == 0 else f'FAIL ({failed} of {len(checks)} checks)'}", flush=True)
-    return failed == 0
+    for check in checks:
+        value = "-" if check["value"] is None else f"{check['value']:.3e}"
+        note = f"  ({check['note']})" if check["note"] else ""
+        print(f"  {check['status']:<4s}  {check['name']:<62s} {value:>11s}  <= {check['threshold']:.1e}{note}", flush=True)
+    failed = [check for check in checks if check["status"] == "FAIL"]
+    skipped = sum(check["status"] == "SKIP" for check in checks)
+    noise_limited = sum(check["note"].startswith("noise-limited") for check in failed)
+    if failed:
+        overall = f"FAIL ({len(failed)} of {len(checks)} checks, {noise_limited} of them noise-limited)"
+    else:
+        overall = "PASS"
+    if skipped:
+        overall += f", {skipped} skipped"
+    print(f"overall: {overall}", flush=True)
+    return not failed
 
 
 def main():
@@ -328,14 +433,50 @@ def main():
             compute_forces=False,
         ).energy
 
+    def pair_keys(trial):
+        """Sorted i*N+j keys of the real (unpadded) QEq pairs, as built inside qeq.calculate."""
+        pairs = np.asarray(
+            qeq.neighbor_pairs(
+                np.asarray(trial.get_positions(), dtype=qeq.np_dtype),
+                np.asarray(trial.get_cell(), dtype=qeq.np_dtype),
+            )
+        )
+        real = pairs[np.asarray(pair_buffer_scales(pairs)) > 0, :2].astype(np.int64)
+        return np.unique(real.min(axis=1) * len(trial) + real.max(axis=1))
+
+    def pairs_changed(first, second):
+        return int(len(np.setxor1d(pair_keys(first), pair_keys(second), assume_unique=True)))
+
     def fd_projection(direction, step, tag):
+        """Central differences; also the number of QEq pairs that differ between the ± geometries.
+
+        The real-space PME and Gaussian-correction terms are truncated at the cutoff without
+        smoothing, so a pair crossing it adds an energy step that does not vanish with the
+        step size and must not be read as a force error.
+        """
         plus = displaced(atoms, step * direction)
         minus = displaced(atoms, -step * direction)
         check_electrodes(plus, f"{tag}+")
         check_electrodes(minus, f"{tag}-")
         fd_full = -(energy_full(plus) - energy_full(minus)) / (2.0 * step)
         fd_frozen = -(energy_frozen(plus) - energy_frozen(minus)) / (2.0 * step)
-        return fd_full, fd_frozen
+        return fd_full, fd_frozen, pairs_changed(plus, minus)
+
+    def fd_row(step, whole, frozen, fd_full, fd_frozen, changed):
+        return {
+            "step": step,
+            "whole": whole,
+            "frozen": frozen,
+            "fd_full": fd_full,
+            "fd_frozen": fd_frozen,
+            "whole_minus_fd_full": whole - fd_full,
+            "frozen_minus_fd_frozen": frozen - fd_frozen,
+            "pairs_changed": changed,
+            "cutoff_crossed": changed > 0,
+            # E(+) - E(-) minus the analytic prediction: the energy step when a pair crossed the cutoff.
+            "implied_jump_frozen": (frozen - fd_frozen) * 2.0 * step,
+            "implied_jump_full": (whole - fd_full) * 2.0 * step,
+        }
 
     repeats = {"full": [], "frozen": []}
     for _ in range(args.repeats):
@@ -359,28 +500,45 @@ def main():
         alphas = np.linspace(-args.scan_range, args.scan_range, 2 * (args.scan_points // 2) + 1)
         start = time.perf_counter()
         for name, direction in directions.items():
-            e_full = np.array([energy_full(displaced(atoms, alpha * direction)) for alpha in alphas])
-            e_frozen = np.array([energy_frozen(displaced(atoms, alpha * direction)) for alpha in alphas])
-            slope_full, noise_full = fit_scan(alphas, e_full)
-            slope_frozen, noise_frozen = fit_scan(alphas, e_frozen)
+            geometries = [displaced(atoms, alpha * direction) for alpha in alphas]
+            e_full = np.array([energy_full(trial) for trial in geometries])
+            e_frozen = np.array([energy_frozen(trial) for trial in geometries])
+            keys = [pair_keys(trial) for trial in geometries]
+            # One step regressor per scan interval in which the QEq neighbor list changes.
+            jumps = [
+                0.5 * (alphas[k] + alphas[k + 1])
+                for k in range(len(alphas) - 1)
+                if not np.array_equal(keys[k], keys[k + 1])
+            ]
+            slope_full, noise_full, std_full = fit_scan(alphas, e_full, jumps)
+            slope_frozen, noise_frozen, std_frozen = fit_scan(alphas, e_frozen, jumps)
             scan_summary[name] = {
                 "whole": float(np.sum(ref_whole.forces * direction)),
                 "frozen": float(np.sum(ref_frozen.forces * direction)),
                 "fit_full": slope_full,
                 "fit_frozen": slope_frozen,
+                "slope_std_full": std_full,
+                "slope_std_frozen": std_frozen,
                 "noise_rms_full": noise_full,
                 "noise_rms_frozen": noise_frozen,
+                "neighbor_list_changes": len(jumps),
             }
             scan_rows.extend(
                 {"direction": name, "alpha": float(alpha), "energy_full": float(a), "energy_frozen": float(b)}
                 for alpha, a, b in zip(alphas, e_full, e_frozen)
             )
+
+        def fmt(value, spec):
+            return f"{'-':>{spec.split('.')[0]}}" if value is None else f"{value:{spec}}"
+
         print(f"\n=== energy scan, {len(alphas)} points in +/-{args.scan_range} A ({time.perf_counter() - start:.1f} s) ===", flush=True)
-        print(f"{'direction':<26s} {'whole':>11} {'fit_full':>11} {'frozen':>11} {'fit_frozen':>11} {'noise_full':>11} {'noise_frz':>11}")
+        print("fit: degree-4 polynomial plus one step per interval where the QEq neighbor list changes", flush=True)
+        print(f"{'direction':<26s} {'whole':>11} {'fit_full':>11} {'frozen':>11} {'fit_frozen':>11} {'noise_full':>11} {'noise_frz':>11} {'nl_changes':>10}")
         for name, item in scan_summary.items():
             print(
-                f"{name:<26s} {item['whole']:11.5f} {item['fit_full']:11.5f} {item['frozen']:11.5f} "
-                f"{item['fit_frozen']:11.5f} {item['noise_rms_full']:11.3e} {item['noise_rms_frozen']:11.3e}",
+                f"{name:<26s} {item['whole']:11.5f} {fmt(item['fit_full'], '11.5f')} {item['frozen']:11.5f} "
+                f"{fmt(item['fit_frozen'], '11.5f')} {fmt(item['noise_rms_full'], '11.3e')} "
+                f"{fmt(item['noise_rms_frozen'], '11.3e')} {item['neighbor_list_changes']:10d}",
                 flush=True,
             )
 
@@ -402,26 +560,21 @@ def main():
             whole = float(ref_whole.forces[index, axis])
             frozen = float(ref_frozen.forces[index, axis])
             for step in args.steps:
-                fd_full, fd_frozen = fd_projection(direction, step, f"atom{index}{AXES[axis]}@{step}")
+                fd_full, fd_frozen, changed = fd_projection(direction, step, f"atom{index}{AXES[axis]}@{step}")
                 component_rows.append(
                     {
                         "atom": index,
                         "element": symbols[index],
                         "label": label,
                         "axis": AXES[axis],
-                        "step": step,
-                        "whole": whole,
-                        "frozen": frozen,
-                        "fd_full": fd_full,
-                        "fd_frozen": fd_frozen,
-                        "whole_minus_fd_full": whole - fd_full,
-                        "frozen_minus_fd_frozen": frozen - fd_frozen,
+                        **fd_row(step, whole, frozen, fd_full, fd_frozen, changed),
                     }
                 )
                 print(
                     f"atom={index:5d} {symbols[index]:>2s} {AXES[axis]} step={step:.4f}  "
                     f"whole={whole: .6e}  fd_full={fd_full: .6e}  "
-                    f"frozen={frozen: .6e}  fd_frozen={fd_frozen: .6e}",
+                    f"frozen={frozen: .6e}  fd_frozen={fd_frozen: .6e}"
+                    + (f"  [cutoff crossed: {changed} pairs]" if changed else ""),
                     flush=True,
                 )
     print(f"component tests: {time.perf_counter() - start:.1f} s", flush=True)
@@ -431,25 +584,17 @@ def main():
         whole = float(np.sum(ref_whole.forces * direction))
         frozen = float(np.sum(ref_frozen.forces * direction))
         for step in args.steps:
-            fd_full, fd_frozen = fd_projection(direction, step, f"{name}@{step}")
-            directional_rows.append(
-                {
-                    "direction": name,
-                    "step": step,
-                    "whole": whole,
-                    "frozen": frozen,
-                    "fd_full": fd_full,
-                    "fd_frozen": fd_frozen,
-                    "whole_minus_fd_full": whole - fd_full,
-                    "frozen_minus_fd_frozen": frozen - fd_frozen,
-                }
-            )
+            fd_full, fd_frozen, changed = fd_projection(direction, step, f"{name}@{step}")
+            directional_rows.append({"direction": name, **fd_row(step, whole, frozen, fd_full, fd_frozen, changed)})
             print(
                 f"{name:<26s} step={step:.4f}  whole={whole: .6e}  fd_full={fd_full: .6e}  "
-                f"frozen={frozen: .6e}  fd_frozen={fd_frozen: .6e}",
+                f"frozen={frozen: .6e}  fd_frozen={fd_frozen: .6e}"
+                + (f"  [cutoff crossed: {changed} pairs]" if changed else ""),
                 flush=True,
             )
 
+    print_crossings("component tests", component_rows, lambda row: f"atom {row['atom']} {row['element']} {row['axis']}")
+    print_crossings("directional tests", directional_rows, lambda row: row["direction"])
     component_summary = summarize(component_rows, args.steps)
     directional_summary = summarize(directional_rows, args.steps)
     print_summary("component tests, mean |error|", component_summary)
@@ -502,10 +647,11 @@ def main():
                 "components": component_summary,
                 "directional": directional_summary,
                 "net_force": net_force,
-                "checks": [
-                    {"name": name, "value": value, "threshold": threshold, "passed": bool(ok)}
-                    for name, value, threshold, ok in checks
-                ],
+                "cutoff_crossings": {
+                    "components": sum(row["cutoff_crossed"] for row in component_rows),
+                    "directional": sum(row["cutoff_crossed"] for row in directional_rows),
+                },
+                "checks": checks,
                 "passed": passed,
             },
             indent=2,

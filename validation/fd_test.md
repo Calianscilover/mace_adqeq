@@ -57,7 +57,13 @@ python validation/fd_force_test.py --const-potential
 python validation/fd_force_test.py --frame 1      # 再取 2–3 帧，包括离子靠近电极的构型
 ```
 
-脚本最后会打印 PASS/FAIL 表，并写入 `fd_summary.json` 的 `checks` 和 `passed` 字段；任何一项失败时退出码为 1。默认阈值（可用命令行参数修改）：
+脚本最后会打印 PASS/FAIL 表，并写入 `fd_summary.json` 的 `checks` 和 `passed` 字段；任何一项失败时退出码为 1。
+
+**cutoff 跨越的处理**：实空间 PME 项和高斯修正在 cutoff（6 Å）处直接截断，某个原子对在 ±δ 两个构型之间跨过 cutoff 时，能量会多出一个不随 δ 减小的台阶。脚本比较 ±δ 两个构型的 QEq 邻居对集合，把发生变化的行标记为 `cutoff_crossed`，单独列出它们的能量台阶（`implied_jump_frozen` / `implied_jump_full`），并从误差统计中排除。能量扫描的拟合对每个邻居表发生变化的区间加一个台阶项。用 `test_106` 回放：108 行中有 33 行跨越 cutoff，台阶为 2e-6 到 2.5e-4 eV；排除后冻结路径误差为 1.7e-7 eV/Å。
+
+**noise-limited**：如果某项 FAIL 的数值不超过实测能量噪声对应误差的 3 倍，会标注 `noise-limited`，表示在当前噪声下无法分辨，不代表梯度有错。完整路径受 float32 参数 MLP 的舍入噪声（约 5e-4 到 1e-3 eV）限制，`whole` 相关的检查通常是这种情况。
+
+默认阈值（可用命令行参数修改）：
 
 | 检查 | 默认阈值 | 参数 |
 |---|---|---|
@@ -71,8 +77,9 @@ python validation/fd_force_test.py --frame 1      # 再取 2–3 帧，包括离
 
 人工复核：
 
-- [ ] `whole` 与 `fd_full` 的误差随 δ 按约 δ² 下降，直到噪声底 `≈ 能量噪声 / δ`。
-- [ ] 三条命令（含至少 2 帧不同构型）全部 `overall: PASS`。
+- [ ] 冻结路径的检查全部 PASS（排除 cutoff 跨越的行之后）。
+- [ ] `whole` 相关的 FAIL 全部是 `noise-limited`；参数响应方向的检查（`directional: response error / |response|`）在 1% 以内。
+- [ ] 三条命令（含至少 2 帧不同构型）都满足以上两条。
 
 ### 2.3 生产噪声（仅供参考，不要求 PASS）
 
@@ -130,7 +137,7 @@ PR #1 之前的 matrix 求解器给出的电荷是错的，依赖它的数据都
 - [ ] **NVE**：用生产配置（hybrid + CG、float64、恒电势开/关）、生产时间步长，跑至少 10–50 ps。统计总能量漂移（meV/atom/ps）和涨落，并与相同设置下纯短程 MACE 的漂移对比。
 - [ ] **cutoff 截断**：实空间 PME 项和高斯修正在 cutoff 处直接截断。每对原子跨越 cutoff 时，能量跳变约为
   `ΔE ≈ 14.40 · q_i q_j · [erfc(κ r_c) − erfc(r_c / (√2 η_ij))] / r_c` eV。
-  在一个典型构型上统计 cutoff 附近所有原子对的 |ΔE|。如果不可忽略，考虑加大 cutoff 或加平滑切换函数。
+  `test_106` 的有限差分测试已经证实存在这种台阶：单次跨越约 2e-6 到 2.5e-4 eV（见 `fd_force_test.py` 输出的 cutoff 跨越表）。需要在 NVE 中量化累积效应；如果不可忽略，考虑加大 cutoff 或加平滑切换函数。
 - [ ] **电极原子重新归属**（恒电势）：`determine_chi` 是离散判断，归属改变时 χ 突变 +10 或 −2 eV，能量跳变约为“偏置 × 该原子电荷”。在 MD 中记录每一步的电极原子集合，统计改变的次数；如果有改变，考虑用 `forced_bottom_indices` / `forced_upper_indices` 固定电极原子。
 - [ ] 记录每步的 `qeq_solver`、`qeq_pg_iterations`、`qeq_pg_error`，统计 `matrix_fallback` 的频率和 CG 迭代数的变化趋势。
 - [ ] 检查电荷有没有失控（例如 max|q| 随时间增长），检查结构稳定性（RDF、密度），有条件时与 AIMD 对比。
