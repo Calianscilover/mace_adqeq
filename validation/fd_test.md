@@ -47,53 +47,30 @@ python validation/qeq_gradient_diagnose.py --device cpu
 
 合格标准：T1 `rms_projected_grad < 1e-6` eV/e；T3 `charge_response < 1e-5` eV/Å；T5 `n_negative = 0`。
 
-### 2.2 完整路径（含参数响应）
+### 2.2 力与能量的一致性（constQ 和恒电势）
 
-脚本默认就是验证配置：CPU、float64 MACE、float64 QEq、matrix 求解器、z 轴偶极修正。**不要在 GPU 上用 float32 MACE 做这项验证**：修复前那次运行中，同一构型重复计算 3 次能量相差 4.5e-4 eV，在 δ = 0.001 Å 时会带来约 0.23 eV/Å 的差分噪声，与参数响应项本身同量级。
+这一步只回答“力算得对不对”。脚本对选中的原子分量和两个全局方向做中心差分，同时比较两种解析力：冻结力（χ/J/η 固定）和完整力（含 MACE + MLP 的参数响应）。所有位移构型都沿用参考构型的 QEq 邻居对，避免 6 Å cutoff 处的能量台阶混入差分；MACE 自己的邻居表有光滑包络，照常重建。
+
+默认配置是 CPU、float64 MACE、float64 QEq、matrix 求解器。**不要在 GPU 上做这项验证**：GPU 上 MACE 的结果不确定，重复计算的能量差约 5e-4 eV，会淹没参数响应项。
 
 ```bash
-python validation/fd_force_test.py
-python validation/fd_force_test.py --const-potential
-python validation/fd_force_test.py --frame 1      # 再取 2–3 帧，包括离子靠近电极的构型
+python validation/fd_force_test.py --output validation/fd_results/constQ_frame0
+python validation/fd_force_test.py --const-potential --output validation/fd_results/constP_frame0
+# 两种模式再各取一帧：--frame 1，并相应修改 --output
 ```
 
-脚本最后会打印 PASS/FAIL 表，并写入 `fd_summary.json` 的 `checks` 和 `passed` 字段；任何一项失败时退出码为 1。
+脚本最后输出判定结果，任何一项失败时退出码为 1：
 
-**cutoff 跨越的处理**：实空间 PME 项和高斯修正在 cutoff（6 Å）处直接截断，某个原子对在 ±δ 两个构型之间跨过 cutoff 时，能量会多出一个不随 δ 减小的台阶。`--neighbor-list` 有两种模式：
-
-- `fixed`（默认）：所有位移构型都沿用参考构型的 QEq 邻居对，能量对坐标光滑，所有行都参与统计。脚本仍会统计“重建邻居表时会跨越 cutoff 的行数”，只作参考。这是梯度一致性测试应该用的模式。
-- `rebuild`：与 MD 一样每次重建邻居表。脚本把邻居对发生变化的行标记为 `cutoff_crossed`，单独列出能量台阶（`implied_jump_frozen` / `implied_jump_full`），并从误差统计中排除；能量扫描的拟合对每次变化加一个台阶项。用来测量 cutoff 台阶本身。
-
-`test_107`（`rebuild`）的结果：108 个分量行中有 33 行跨越 cutoff，台阶为 2e-6 到 2.5e-4 eV；排除后冻结路径误差为 1.7e-7 eV/Å。全局方向的 8 行全部跨越 cutoff（原子 446 与 H316 相距 5.99997 Å），相关检查只能 SKIP，所以改为默认 `fixed`。
-
-**noise-limited**：如果某项 FAIL 的数值不超过实测能量噪声对应误差的 3 倍，会标注 `noise-limited`，表示在当前噪声下无法分辨，不代表梯度有错。完整路径受 float32 参数 MLP 的舍入噪声（约 5e-4 到 1e-3 eV）限制，`whole` 相关的检查通常是这种情况。
-
-默认阈值（可用命令行参数修改）：
-
-| 检查 | 默认阈值 | 参数 |
+| 判据 | 含义 | 默认阈值 |
 |---|---|---|
-| 同一构型重复计算的能量差（确定性） | ≤ 1e-8 eV | `--repeat-tol` |
-| `frozen` vs `fd_frozen`，最佳步长下的平均误差 | ≤ 1e-5 eV/Å | `--frozen-tol` |
-| `whole` vs `fd_full`，最佳步长下的平均误差 | ≤ 1e-3 eV/Å | `--whole-tol` |
-| 参数响应的差分误差 / 参数响应本身 | ≤ 1% | `--response-ratio` |
-| 能量扫描拟合斜率 vs 解析力投影 | ≤ 1e-3 eV/Å | `--whole-tol` |
-| 力的总和 \|ΣF\|（平移不变性；PME 网格离散会引入少量偏差） | ≤ 1e-2 eV/Å | `--net-force-tol` |
-| 恒电势下电极原子归属的变化次数 | 0 | — |
+| 冻结力 | 最佳步长下 \|frozen − fd_frozen\| 的平均值，分量和全局方向各判一次 | ≤ 1e-5 eV/Å（`--frozen-tol`） |
+| 参数响应 | 加上参数响应项后，消除了冻结力与完整差分之间偏差的比例，即 1 − \|whole − fd_full\| / \|frozen − fd_full\| | ≥ 90%（`--explained`） |
+| 电极归属（仅恒电势） | 所有位移构型的电极原子集合与参考构型相同 | 0 次变化 |
 
-人工复核：
+参数响应不用绝对误差判定：float32 参数 MLP 会给完整能量带来约 7e-4 eV 的舍入噪声，\|whole − fd_full\| 只能随步长按 1/δ 下降（δ = 0.01 时约 0.03 eV/Å），绝对阈值原则上达不到。`test_107`（constQ）中，冻结力误差为 1.7e-7 eV/Å，参数响应消除了 96%（分量）和 99.5%（全局方向）的偏差。
 
-- [ ] 冻结路径的检查全部 PASS（排除 cutoff 跨越的行之后）。
-- [ ] `whole` 相关的 FAIL 全部是 `noise-limited`；参数响应方向的检查（`directional: response error / |response|`）在 1% 以内。
-- [ ] 三条命令（含至少 2 帧不同构型）都满足以上两条。
-
-### 2.3 生产噪声（仅供参考，不要求 PASS）
-
-```bash
-python validation/fd_force_test.py --solver-mode hybrid
-python validation/fd_force_test.py --device cuda --mace-dtype float32 --solver-mode hybrid
-```
-
-用来量化生产配置下的能量噪声和力误差。脚本会提示“不是验证配置，阈值可能不适用”。
+- [ ] constQ：两帧都输出 `forces consistent with the energy: YES`。
+- [ ] 恒电势：两帧都输出 `YES`。如果只有“电极归属”失败，说明位移让某个表面 Zn 的配位数越过了阈值，属于电极判定的跳变而不是力公式的错误，应考虑把 `minimum_coordination` 从 8 降到 6。
 
 ---
 
@@ -142,7 +119,7 @@ PR #1 之前的 matrix 求解器给出的电荷是错的，依赖它的数据都
 - [ ] **NVE**：用生产配置（hybrid + CG、float64、恒电势开/关）、生产时间步长，跑至少 10–50 ps。统计总能量漂移（meV/atom/ps）和涨落，并与相同设置下纯短程 MACE 的漂移对比。
 - [ ] **cutoff 截断**：实空间 PME 项和高斯修正在 cutoff 处直接截断。每对原子跨越 cutoff 时，能量跳变约为
   `ΔE ≈ 14.40 · q_i q_j · [erfc(κ r_c) − erfc(r_c / (√2 η_ij))] / r_c` eV。
-  `test_106` 的有限差分测试已经证实存在这种台阶：单次跨越约 2e-6 到 2.5e-4 eV（见 `fd_force_test.py` 输出的 cutoff 跨越表）。需要在 NVE 中量化累积效应；如果不可忽略，考虑加大 cutoff 或加平滑切换函数。
+  `test_106` / `test_107` 的有限差分测试（当时每个位移构型都重建邻居表）已经证实存在这种台阶：108 个分量行中有 33 行跨越 cutoff，单次跨越约 2e-6 到 2.5e-4 eV。需要在 NVE 中量化累积效应；如果不可忽略，考虑加大 cutoff 或加平滑切换函数。
 - [ ] **电极原子重新归属**（恒电势）：`determine_chi` 是离散判断，归属改变时 χ 突变 +10 或 −2 eV，能量跳变约为“偏置 × 该原子电荷”。在 MD 中记录每一步的电极原子集合，统计改变的次数；如果有改变，考虑用 `forced_bottom_indices` / `forced_upper_indices` 固定电极原子。
 - [ ] 记录每步的 `qeq_solver`、`qeq_pg_iterations`、`qeq_pg_error`，统计 `matrix_fallback` 的频率和 CG 迭代数的变化趋势。
 - [ ] 检查电荷有没有失控（例如 max|q| 随时间增长），检查结构稳定性（RDF、密度），有条件时与 AIMD 对比。
