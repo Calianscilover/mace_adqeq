@@ -76,16 +76,34 @@ python validation/fd_force_test.py --const-potential --output validation/fd_resu
 
 ## 3. 测试 2：生产求解路径（hybrid + CG）
 
-有限差分测试默认用 matrix 求解器；MD 每帧实际走的是 hybrid 模式下 warm start 的 CG（脚本默认 `--pg-method cg`）。
+有限差分测试用的是 matrix 求解器；MD 每帧实际走的是 hybrid 模式：第一帧用 matrix，之后从上一帧的电荷 warm start，用 CG 求解；只有 CG 误差超过 `max(10 × pg_tol, 1e-5)`（默认 1e-2）时才回退到 matrix。
+
+脚本沿一条轨迹逐帧调用同一个 hybrid 模型，调用方式与 `calculator.py` 完全相同（`calculate(atoms, predictor=...)`）：每帧重新预测参数，恒电势下重新判定电极，比较的是含参数响应的完整力。每一帧都与同一构型上 float64 matrix 求解器的结果对比。轨迹默认是从 `--structure` 出发、每步每个坐标随机位移 0.01 Å 的 50 帧随机游走；有了真实 MD 轨迹后，可以用 `--trajectory` 直接读入。
 
 ```bash
-python validation/pg_solver_check.py --device cpu --frames 20 --output pg_solver_cg.json
-python validation/pg_solver_check.py --device cpu --frames 20 --const-potential --output pg_solver_cg_cp.json
+python validation/pg_solver_check.py --output validation/pg_constQ.json
+python validation/pg_solver_check.py --const-potential --output validation/pg_constP.json
+# 误差会不会随 warm start 累积：加长轨迹
+python validation/pg_solver_check.py --frames 200 --output validation/pg_constQ_long.json
 ```
 
-- [ ] 所有帧都是 `projected_gradient`，没有 `matrix_fallback`。
-- [ ] float64：`max_force_error < 1e-4` eV/Å。
-- [ ] 用更长的随机游走（`--frames` 加大），检查误差会不会随 warm start 累积。
+判定（第 0 帧两边都是 matrix，不计入；任何一项失败时退出码为 1）：
+
+| 判据 | 含义 | 默认阈值 |
+|---|---|---|
+| 输入相同 | 两次调用得到的 χ/J/η 完全一致，否则比较的是预测器的噪声而不是求解器。必须用 `--device cpu` | ≤ 1e-10（`--parameter-tol`） |
+| 没有回退 | 第 1 帧起全部是 `projected_gradient` | 0 帧 `matrix_fallback` |
+| 力 | 每一帧的 max \|F_hybrid − F_matrix\| | ≤ 1e-4 eV/Å（`--force-tol`） |
+
+最后输出 `production solver matches the matrix solver: YES/NO`。汇总里另外列出三项供复核，它们不参与判定：
+
+- 跑满 `--pg-maxiter` 的帧：CG 没收敛到 `pg_tol`，但误差不到 1e-2，会被直接采用而不回退。逐帧表里这些帧的 `max|dF|` 是最需要看的。
+- 电极重新归属的帧（仅恒电势）：该帧 χ 跳变 10 eV，warm start 的起点离解最远。
+- 逐帧表的 `max|Pg|`：在 float64 下、用求解器实际看到的 χ（含电极偏置）重新计算的投影梯度，是对 CG 自报误差 `pg_err` 的独立核对。
+
+- [ ] constQ：50 帧输出 `YES`。
+- [ ] 恒电势：50 帧输出 `YES`；如果有电极重新归属的帧，确认它们也满足力的阈值。
+- [ ] 200 帧的长轨迹：后段的 `max|dF|` 没有比前段明显增大（误差不随 warm start 累积）。
 
 ---
 
