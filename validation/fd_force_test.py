@@ -22,9 +22,13 @@ production noise; the PASS/FAIL thresholds below are meant for the defaults.
 
 The real-space QEq terms are truncated at the cutoff without smoothing, so a pair
 crossing it between the +/- geometries adds an energy step that does not vanish
-with the step size. Such rows are flagged, reported with their implied energy
-jump, and excluded from the error statistics; the energy-scan fit gets one step
-term per interval in which the QEq neighbor list changes.
+with the step size. With --neighbor-list fixed (default) every displaced geometry
+reuses the QEq pairs of the reference geometry, so the tested energy is smooth and
+no row is excluded; crossings that a rebuilt list would have are only counted.
+MACE keeps rebuilding its own graph, which is smooth through its radial envelope.
+With --neighbor-list rebuild, rows whose +/- geometries differ in the QEq pairs
+are flagged, reported with their implied energy jump and excluded from the error
+statistics, and the energy-scan fit gets one step term per neighbor-list change.
 
 The run ends with PASS/FAIL checks (determinism, frozen and whole force vs
 finite differences at the best step, parameter response, energy scan, net
@@ -92,6 +96,12 @@ def parse_args():
     parser.add_argument("--pg-method", choices=["cg", "lbfgs"], default="cg")
     parser.add_argument("--pg-tol", type=float, default=1.0e-3)
     parser.add_argument("--dipole-axis", type=int, choices=(0, 1, 2), default=2)
+    parser.add_argument(
+        "--neighbor-list",
+        choices=["fixed", "rebuild"],
+        default="fixed",
+        help="QEq pairs on displaced geometries: fixed reuses the reference pairs (smooth energy), rebuild uses a fresh list as in MD",
+    )
     parser.add_argument("--steps", type=float, nargs="+", default=[0.001, 0.002, 0.005, 0.01], help="displacements in Angstrom")
     parser.add_argument("--scan-points", type=int, default=21, help="energy scan points per direction; 0 disables the scan")
     parser.add_argument("--scan-range", type=float, default=0.02, help="energy scan half-range in Angstrom (3N norm)")
@@ -225,7 +235,7 @@ def print_summary(title, summary):
     def fmt(value, width):
         return f"{'-':>{width}}" if value is None else f"{value:{width}.3e}"
 
-    print(f"\n=== {title}, rows crossing the QEq cutoff excluded (eV/A) ===")
+    print(f"\n=== {title}, rows with a QEq cutoff crossing excluded (eV/A) ===")
     print(f"{'step':>8} {'n':>4} {'clean':>5} {'whole-fd':>12} {'frozen-fd':>12} {'frozen-fdfrz':>13} {'|resp|':>10} {'resp err':>10}")
     for step, item in summary.items():
         print(
@@ -237,9 +247,17 @@ def print_summary(title, summary):
         )
 
 
-def print_crossings(title, rows, label):
+def print_crossings(title, rows, label, neighbor_list):
+    if neighbor_list == "fixed":
+        would_cross = sum(row["pairs_changed"] > 0 for row in rows)
+        print(
+            f"\n=== {title}: {would_cross} of {len(rows)} rows would cross the QEq cutoff with a rebuilt "
+            f"neighbor list; the fixed reference list keeps them smooth, none excluded ===",
+            flush=True,
+        )
+        return
     crossed = [row for row in rows if row["cutoff_crossed"]]
-    print(f"\n=== {title}: {len(crossed)} of {len(rows)} rows cross the QEq cutoff (excluded above) ===", flush=True)
+    print(f"\n=== {title}: {len(crossed)} of {len(rows)} rows cross the QEq cutoff (excluded below) ===", flush=True)
     if crossed:
         print(f"{'row':<34s} {'step':>7} {'pairs':>5} {'jump_frozen eV':>15} {'jump_full eV':>13}", flush=True)
     for row in crossed:
@@ -369,9 +387,17 @@ def main():
     print(f"structure={args.structure}  frame={args.frame}  natoms={len(atoms)}  pbc={atoms.pbc.tolist()}", flush=True)
     print(
         f"device={args.device}  dtype={args.dtype}  mace_dtype={mace_dtype!r}  solver_mode={args.solver_mode}  "
-        f"pg_method={args.pg_method}  dipole_axis={args.dipole_axis}  const_potential={args.const_potential}  steps={args.steps}",
+        f"pg_method={args.pg_method}  dipole_axis={args.dipole_axis}  const_potential={args.const_potential}  "
+        f"neighbor_list={args.neighbor_list}  steps={args.steps}",
         flush=True,
     )
+    rebuild_pairs = qeq.neighbor_pairs
+    if args.neighbor_list == "fixed":
+        reference_pairs = rebuild_pairs(
+            np.asarray(atoms.get_positions(), dtype=qeq.np_dtype),
+            np.asarray(atoms.get_cell(), dtype=qeq.np_dtype),
+        )
+        qeq.neighbor_pairs = lambda positions, box: reference_pairs
     if args.device != "cpu" or mace_dtype != "float64" or args.dtype != "float64" or args.solver_mode != "matrix":
         print("NOTE: not the validation setting (cpu, float64 MACE/QEq, matrix); PASS/FAIL thresholds may not apply", flush=True)
 
@@ -434,9 +460,9 @@ def main():
         ).energy
 
     def pair_keys(trial):
-        """Sorted i*N+j keys of the real (unpadded) QEq pairs, as built inside qeq.calculate."""
+        """Sorted i*N+j keys of the real (unpadded) QEq pairs a rebuilt neighbor list would contain."""
         pairs = np.asarray(
-            qeq.neighbor_pairs(
+            rebuild_pairs(
                 np.asarray(trial.get_positions(), dtype=qeq.np_dtype),
                 np.asarray(trial.get_cell(), dtype=qeq.np_dtype),
             )
@@ -472,7 +498,8 @@ def main():
             "whole_minus_fd_full": whole - fd_full,
             "frozen_minus_fd_frozen": frozen - fd_frozen,
             "pairs_changed": changed,
-            "cutoff_crossed": changed > 0,
+            # Only a rebuilt list puts the crossing into the energy; a fixed list keeps it smooth.
+            "cutoff_crossed": changed > 0 and args.neighbor_list == "rebuild",
             # E(+) - E(-) minus the analytic prediction: the energy step when a pair crossed the cutoff.
             "implied_jump_frozen": (frozen - fd_frozen) * 2.0 * step,
             "implied_jump_full": (whole - fd_full) * 2.0 * step,
@@ -504,12 +531,13 @@ def main():
             e_full = np.array([energy_full(trial) for trial in geometries])
             e_frozen = np.array([energy_frozen(trial) for trial in geometries])
             keys = [pair_keys(trial) for trial in geometries]
-            # One step regressor per scan interval in which the QEq neighbor list changes.
-            jumps = [
+            changes = [
                 0.5 * (alphas[k] + alphas[k + 1])
                 for k in range(len(alphas) - 1)
                 if not np.array_equal(keys[k], keys[k + 1])
             ]
+            # One step regressor per scan interval in which a rebuilt QEq neighbor list changes.
+            jumps = changes if args.neighbor_list == "rebuild" else []
             slope_full, noise_full, std_full = fit_scan(alphas, e_full, jumps)
             slope_frozen, noise_frozen, std_frozen = fit_scan(alphas, e_frozen, jumps)
             scan_summary[name] = {
@@ -521,7 +549,8 @@ def main():
                 "slope_std_frozen": std_frozen,
                 "noise_rms_full": noise_full,
                 "noise_rms_frozen": noise_frozen,
-                "neighbor_list_changes": len(jumps),
+                "neighbor_list_changes": len(changes),
+                "step_terms": len(jumps),
             }
             scan_rows.extend(
                 {"direction": name, "alpha": float(alpha), "energy_full": float(a), "energy_frozen": float(b)}
@@ -532,7 +561,10 @@ def main():
             return f"{'-':>{spec.split('.')[0]}}" if value is None else f"{value:{spec}}"
 
         print(f"\n=== energy scan, {len(alphas)} points in +/-{args.scan_range} A ({time.perf_counter() - start:.1f} s) ===", flush=True)
-        print("fit: degree-4 polynomial plus one step per interval where the QEq neighbor list changes", flush=True)
+        if args.neighbor_list == "rebuild":
+            print("fit: degree-4 polynomial plus one step per interval where the QEq neighbor list changes", flush=True)
+        else:
+            print("fit: degree-4 polynomial; fixed QEq neighbor list (nl_changes = changes a rebuilt list would have)", flush=True)
         print(f"{'direction':<26s} {'whole':>11} {'fit_full':>11} {'frozen':>11} {'fit_frozen':>11} {'noise_full':>11} {'noise_frz':>11} {'nl_changes':>10}")
         for name, item in scan_summary.items():
             print(
@@ -593,8 +625,8 @@ def main():
                 flush=True,
             )
 
-    print_crossings("component tests", component_rows, lambda row: f"atom {row['atom']} {row['element']} {row['axis']}")
-    print_crossings("directional tests", directional_rows, lambda row: row["direction"])
+    print_crossings("component tests", component_rows, lambda row: f"atom {row['atom']} {row['element']} {row['axis']}", args.neighbor_list)
+    print_crossings("directional tests", directional_rows, lambda row: row["direction"], args.neighbor_list)
     component_summary = summarize(component_rows, args.steps)
     directional_summary = summarize(directional_rows, args.steps)
     print_summary("component tests, mean |error|", component_summary)
@@ -635,6 +667,7 @@ def main():
                 "pg_tol": args.pg_tol,
                 "dipole_axis": args.dipole_axis,
                 "const_potential": args.const_potential,
+                "neighbor_list": args.neighbor_list,
                 "total_charge": args.total_charge,
                 "steps": args.steps,
                 "energy_whole": ref_whole.energy,
@@ -648,8 +681,9 @@ def main():
                 "directional": directional_summary,
                 "net_force": net_force,
                 "cutoff_crossings": {
-                    "components": sum(row["cutoff_crossed"] for row in component_rows),
-                    "directional": sum(row["cutoff_crossed"] for row in directional_rows),
+                    "components": sum(row["pairs_changed"] > 0 for row in component_rows),
+                    "directional": sum(row["pairs_changed"] > 0 for row in directional_rows),
+                    "excluded": args.neighbor_list == "rebuild",
                 },
                 "checks": checks,
                 "passed": passed,

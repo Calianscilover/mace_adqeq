@@ -59,7 +59,12 @@ python validation/fd_force_test.py --frame 1      # 再取 2–3 帧，包括离
 
 脚本最后会打印 PASS/FAIL 表，并写入 `fd_summary.json` 的 `checks` 和 `passed` 字段；任何一项失败时退出码为 1。
 
-**cutoff 跨越的处理**：实空间 PME 项和高斯修正在 cutoff（6 Å）处直接截断，某个原子对在 ±δ 两个构型之间跨过 cutoff 时，能量会多出一个不随 δ 减小的台阶。脚本比较 ±δ 两个构型的 QEq 邻居对集合，把发生变化的行标记为 `cutoff_crossed`，单独列出它们的能量台阶（`implied_jump_frozen` / `implied_jump_full`），并从误差统计中排除。能量扫描的拟合对每个邻居表发生变化的区间加一个台阶项。用 `test_106` 回放：108 行中有 33 行跨越 cutoff，台阶为 2e-6 到 2.5e-4 eV；排除后冻结路径误差为 1.7e-7 eV/Å。
+**cutoff 跨越的处理**：实空间 PME 项和高斯修正在 cutoff（6 Å）处直接截断，某个原子对在 ±δ 两个构型之间跨过 cutoff 时，能量会多出一个不随 δ 减小的台阶。`--neighbor-list` 有两种模式：
+
+- `fixed`（默认）：所有位移构型都沿用参考构型的 QEq 邻居对，能量对坐标光滑，所有行都参与统计。脚本仍会统计“重建邻居表时会跨越 cutoff 的行数”，只作参考。这是梯度一致性测试应该用的模式。
+- `rebuild`：与 MD 一样每次重建邻居表。脚本把邻居对发生变化的行标记为 `cutoff_crossed`，单独列出能量台阶（`implied_jump_frozen` / `implied_jump_full`），并从误差统计中排除；能量扫描的拟合对每次变化加一个台阶项。用来测量 cutoff 台阶本身。
+
+`test_107`（`rebuild`）的结果：108 个分量行中有 33 行跨越 cutoff，台阶为 2e-6 到 2.5e-4 eV；排除后冻结路径误差为 1.7e-7 eV/Å。全局方向的 8 行全部跨越 cutoff（原子 446 与 H316 相距 5.99997 Å），相关检查只能 SKIP，所以改为默认 `fixed`。
 
 **noise-limited**：如果某项 FAIL 的数值不超过实测能量噪声对应误差的 3 倍，会标注 `noise-limited`，表示在当前噪声下无法分辨，不代表梯度有错。完整路径受 float32 参数 MLP 的舍入噪声（约 5e-4 到 1e-3 eV）限制，`whole` 相关的检查通常是这种情况。
 
