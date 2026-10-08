@@ -73,7 +73,7 @@ python run_singlepoint.py \
 
 `MACEJAXQEqCalculator` 固定按总电荷 0 求解，只适用于电中性体系；`atoms.info["total_charge"]` 和 `run_singlepoint.py` 的 `--total-charge` 不会改变 calculator 的求解结果。
 
-正式生产 MD 前的验证步骤见 `validation/fd_test.md`。
+正式生产 MD 前的验证步骤见 `validation/fd_test.md`。验证通过后，用主动学习补充训练数据，见 `active_learning/active_learning.md`。
 
 在当前 `py3.9` 环境中可先独立验证 QEq，并列出前 93 个 Zn 中电荷为负的原子序号：
 
