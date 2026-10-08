@@ -18,3 +18,11 @@ mace-scf/
 validation/jax_model/
 validation/fd_results/
 validation/*.json
+
+# Active-learning inputs and outputs (see active_learning/active_learning.md)
+active_learning/stru/
+active_learning/data/
+active_learning/jax_model/
+active_learning/committee/
+active_learning/runs/
+active_learning/al/
